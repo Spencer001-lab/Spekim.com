@@ -1,0 +1,215 @@
+const express = require('express');
+const helmet = require('helmet');
+const csrf = require('csurf');
+const bodyParser = require('body-parser');
+const cookieParser = require('cookie-parser');
+const passport = require('passport');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const mongoose = require('mongoose');
+const expressRateLimit = require('express-rate-limit');
+const winston = require('winston');
+const morgan = require('morgan');
+const dotenv = require('dotenv');
+
+// Initialize environment variables
+dotenv.config();
+
+// Initialize express app
+const app = express();
+
+// Configure logging (Winston + Morgan)
+winston.add(new winston.transports.Console({
+  format: winston.format.combine(winston.format.colorize(), winston.format.simple())
+}));
+app.use(morgan('combined', { stream: winston.stream.write }));
+
+// Body parser and cookie parser
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+app.use(cookieParser());
+
+// Helmet for security headers
+app.use(helmet());
+
+// CSRF Protection (set up before using passport)
+const csrfProtection = csrf({ cookie: true });
+app.use(csrfProtection);
+
+// Rate Limiting to protect against brute-force attacks
+const limiter = expressRateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use(limiter);
+
+// Database connection (MongoDB example)
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => winston.info('Connected to MongoDB'))
+  .catch(err => winston.error('Error connecting to MongoDB', err));
+
+// User Schema and Model
+const userSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  email: { type: String, required: true, unique: true, lowercase: true },
+  password: { type: String, required: true }
+});
+
+const User = mongoose.model('User', userSchema);
+
+// Passport Strategy (JWT)
+passport.use(new passport.Strategy(
+  (jwt_payload, done) => {
+    User.findOne({ id: jwt_payload.sub }, (err, user) => {
+      if (err) return done(err);
+      if (!user) return done(null, false);
+      return done(null, user);
+    });
+  }
+));
+
+// Middleware for JWT Authentication
+const authenticateJWT = passport.authenticate('jwt', { session: false });
+
+// Signup route (hash password before saving)
+app.post('/signup', async (req, res) => {
+  const { name, email, password } = req.body;
+  
+  const existingUser = await User.findOne({ email });
+  if (existingUser) {
+    return res.status(400).json({ message: 'Email already exists' });
+  }
+
+  // Hash password before storing it
+  const hashedPassword = await bcrypt.hash(password, 10);
+  
+  const newUser = new User({
+    name,
+    email,
+    password: hashedPassword
+  });
+  
+  await newUser.save();
+  res.status(201).json({ message: 'User created successfully' });
+});
+
+// Login route (generate JWT token after password check)
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  const user = await User.findOne({ email });
+  if (!user) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+
+  const isMatch = await bcrypt.compare(password, user.password);
+  if (!isMatch) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+
+  const payload = { sub: user.id };
+  const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+  res.json({ token });
+});
+
+// Protected route
+app.get('/protected', authenticateJWT, (req, res) => {
+  res.json({ message: 'You have access to this protected route' });
+});
+
+// Error handling (for CSRF token errors and others)
+app.use((err, req, res, next) => {
+  if (err.code === 'EBADCSRFTOKEN') {
+    res.status(403).json({ message: 'Invalid CSRF token' });
+  } else {
+    winston.error(err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Run server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  winston.info(`Server running on port ${PORT}`);
+});
+import React, { useState } from 'react';
+import axios from 'axios';
+import { BrowserRouter as Router, Route, Switch, Link } from 'react-router-dom';
+
+const App = () => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [token, setToken] = useState(null);
+  const [message, setMessage] = useState('');
+
+  // Login function
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await axios.post('http://localhost:5000/login', { email, password });
+      setToken(res.data.token);
+      setMessage('Login successful');
+    } catch (error) {
+      setMessage('Login failed');
+    }
+  };
+
+  // Fetch protected data
+  const fetchProtectedData = async () => {
+    try {
+      const res = await axios.get('http://localhost:5000/protected', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setMessage(res.data.message);
+    } catch (error) {
+      setMessage('Access denied');
+    }
+  };
+
+  return (
+    <Router>
+      <div>
+        <h1>My Secure App</h1>
+        <nav>
+          <Link to="/">Home</Link> | <Link to="/protected">Protected</Link>
+        </nav>
+        <Switch>
+          <Route exact path="/">
+            <h2>Login</h2>
+            <form onSubmit={handleLogin}>
+              <input
+                type="email"
+                placeholder="Email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+              />
+              <input
+                type="password"
+                placeholder="Password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+              />
+              <button type="submit">Login</button>
+            </form>
+            <p>{message}</p>
+          </Route>
+          <Route path="/protected">
+            <h2>Protected Route</h2>
+            {token ? (
+              <button onClick={fetchProtectedData}>Fetch Protected Data</button>
+            ) : (
+              <p>You need to login to access this page.</p>
+            )}
+            <p>{message}</p>
+          </Route>
+        </Switch>
+      </div>
+    </Router>
+  );
+};
+
+export default App;

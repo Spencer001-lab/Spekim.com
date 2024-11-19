@@ -1,1 +1,0 @@
-# Spekim.com
